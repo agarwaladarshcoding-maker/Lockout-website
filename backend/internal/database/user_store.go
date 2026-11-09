@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"lockout-backend/internal/models"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,6 +26,7 @@ type UserStore interface {
 	GetUserByID(ctx context.Context, id int) (*models.User, error)
 	UpdateCodeforcesHandle(ctx context.Context, userID int, handle string) error
 	UpdateOnboardingStep(ctx context.Context, userID int, step string) error
+	CreateMatch(ctx context.Context, match *models.Match, challengerID, opponentID int) (int, error)
 }
 
 func (pgs *PostgresUserStore) CreateUser(ctx context.Context, user *models.User) (int, error) {
@@ -163,4 +166,65 @@ func (pgs *PostgresUserStore) UpdateOnboardingStep(ctx context.Context, userID i
 		return fmt.Errorf("failed to update onboarding step: %w", err)
 	}
 	return nil
+}
+
+func (pgs *PostgresUserStore) CreateMatch(ctx context.Context, match *models.Match, challengerID, opponentID int) (int, error) {
+	tx, err := pgs.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if match.Status == "" {
+		match.Status = "in_progress"
+	}
+	if match.NumberOfProblems == 0 {
+		match.NumberOfProblems = 5
+	}
+	if match.StartedAt.IsZero() {
+		match.StartedAt = time.Now()
+	}
+
+	matchQuery := `
+		INSERT INTO matches (num_problems, starting_rating, duration_minutes, status, went_to_tiebreaker, started_at, ended_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id;
+	`
+	var matchID int
+	err = tx.QueryRow(ctx, matchQuery,
+		match.NumberOfProblems,
+		match.StartingRating,
+		match.DurationMinutes,
+		match.Status,
+		match.WentToTiebreaker,
+		match.StartedAt,
+		match.EndedAt,
+	).Scan(&matchID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert match: %w", err)
+	}
+
+	playerQuery := `
+		INSERT INTO match_players (match_id, user_id, role, score, is_winner)
+		VALUES ($1, $2, $3, $4, $5);
+	`
+
+	// Insert challenger
+	_, err = tx.Exec(ctx, playerQuery, matchID, challengerID, "challenger", 0, false)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert challenger: %w", err)
+	}
+
+	// Insert opponent (accepter)
+	_, err = tx.Exec(ctx, playerQuery, matchID, opponentID, "accepter", 0, false)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert opponent: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	match.ID = matchID
+	return matchID, nil
 }
